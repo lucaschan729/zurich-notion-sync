@@ -1,4 +1,3 @@
-import html as htmllib
 import io
 import re
 import sys
@@ -9,19 +8,21 @@ import pdfplumber
 import requests
 
 PAGE = "https://www.zurich.com.hk/zh-hk/customer-services/life-policy-services/zlihk"
+HEADING = "分紅終身人壽保險之實現率"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
       "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8"}
-KEY = re.compile(r"fulfil|ratio|dividend|bonus|participat", re.I)
-MAX_PDF = 8
-MAX_PAGES = 30
+PDF_URL = re.compile(r"https?://[^\s\"'<>\\]+?\.pdf", re.I)
+MAX_DOCS = 8
+MAX_PAGES = 40
 
 
 def get(url):
     for _ in range(3):
         try:
             r = requests.get(url, headers=UA, timeout=60)
-            print(f"HTTP {r.status_code}｜{len(r.content)} bytes｜server={r.headers.get('server')}｜{url}")
+            print(f"HTTP {r.status_code}｜{len(r.content)} bytes｜{r.headers.get('content-type')}"
+                  f"｜last-modified {r.headers.get('last-modified')}｜{url}")
             if r.status_code == 200:
                 return r
         except requests.RequestException as e:
@@ -30,29 +31,63 @@ def get(url):
     return None
 
 
-def clean(s):
-    return re.sub(r"\s+", " ", htmllib.unescape(re.sub(r"<[^>]+>", " ", s))).strip()
+def find_index_pdf(raw):
+    for m in re.finditer(HEADING, raw):
+        hit = PDF_URL.search(raw, m.end(), m.end() + 2000)
+        if hit:
+            return hit.group(0)
+    for m in PDF_URL.finditer(raw):
+        if "fulfil" in m.group(0).lower():
+            return m.group(0)
+    return None
+
+
+def links_of(page):
+    out = []
+    for a in page.annots or []:
+        uri = a.get("uri")
+        if isinstance(uri, bytes):
+            uri = uri.decode("utf-8", errors="replace")
+        if uri:
+            out.append((round(a.get("top") or 0), round(a.get("x0") or 0), uri.strip()))
+    return out
+
+
+def dump_pdf(content):
+    with pdfplumber.open(io.BytesIO(content)) as doc:
+        print(f"共 {len(doc.pages)} 頁")
+        total_pct = total_na = 0
+        for no, page in enumerate(doc.pages[:MAX_PAGES], 1):
+            text = page.extract_text() or ""
+            tables = page.extract_tables()
+            pct = len(re.findall(r"\d+(?:\.\d+)?\s*[%％]", text))
+            na = text.count("不適用") + len(re.findall(r"\bN/?A\b", text))
+            total_pct += pct
+            total_na += na
+            print(f"\n== 第 {no} 頁｜文字 {len(text)} 字｜百分比 {pct} 個｜不適用／N/A {na} 個"
+                  f"｜表格 {len(tables)} 個｜連結 {len(links_of(page))} 個")
+            print(text[:1500 if no <= 2 else 500])
+            for t in tables:
+                print(f"-- 表格：{len(t)} 行 x {max(len(x) for x in t)} 欄")
+                for row in t[:8]:
+                    print("   ", [(c or "").replace("\n", "⏎")[:16] for c in row])
+        print(f"\n合計：百分比 {total_pct} 個｜不適用／N/A {total_na} 個")
 
 
 def dump(url):
     print(f"\n########## {url}")
     r = get(url)
-    if r is None or not r.content.startswith(b"%PDF"):
-        print("讀不到，或者不是 PDF")
+    if r is None:
+        print("讀不到")
         return
-    print(f"last-modified：{r.headers.get('last-modified')}")
-    with pdfplumber.open(io.BytesIO(r.content)) as doc:
-        print(f"共 {len(doc.pages)} 頁")
-        for no, page in enumerate(doc.pages[:MAX_PAGES], 1):
-            text = page.extract_text() or ""
-            tables = page.extract_tables()
-            print(f"\n== 第 {no} 頁｜文字 {len(text)} 字｜百分比 {len(re.findall(r'[%％]', text))} 個"
-                  f"｜不適用 {text.count('不適用')}｜N/A {len(re.findall(r'N/?A', text))}｜表格 {len(tables)} 個")
-            print(text[:1500 if no <= 2 else 500])
-            for t in tables:
-                print(f"-- 表格：{len(t)} 行 x {max(len(x) for x in t)} 欄")
-                for row in t[:8]:
-                    print("   ", [(c or "").replace("\n", "⏎")[:20] for c in row])
+    if r.content.startswith(b"%PDF"):
+        dump_pdf(r.content)
+        return
+    page = r.content.decode("utf-8", errors="replace")
+    found = list(dict.fromkeys(PDF_URL.findall(page)))
+    print(f"不是 PDF；頁面內有 {len(found)} 個 PDF 連結：")
+    for u in found[:30]:
+        print("  ", u)
 
 
 def main():
@@ -61,29 +96,41 @@ def main():
         print("讀不到官方頁")
         sys.exit(1)
     raw = r.content.decode("utf-8", errors="replace").replace("\\u002F", "/").replace("\\/", "/")
+    index = find_index_pdf(raw)
+    if not index:
+        print("官方頁找不到分紅實現率的 PDF 連結")
+        sys.exit(1)
+    print("\n索引文件：", index)
+    r = get(index)
+    if r is None or not r.content.startswith(b"%PDF"):
+        print("讀不到索引文件")
+        sys.exit(1)
 
-    hits = [m.start() for m in re.finditer("實現率", raw)]
-    print(f"\n「實現率」在頁面原始碼出現 {len(hits)} 次")
-    for p in hits[:6]:
-        print("-----")
-        print(raw[max(0, p - 300):p + 900])
+    chosen, everything = [], []
+    with pdfplumber.open(io.BytesIO(r.content)) as doc:
+        for no, page in enumerate(doc.pages, 1):
+            text = page.extract_text() or ""
+            links = links_of(page)
+            print(f"\n== 索引第 {no} 頁｜註解 {len(page.annots or [])} 個｜連結 {len(links)} 個")
+            try:
+                for ln in page.extract_text_lines():
+                    print(f"   文字 y={round(ln['top'])}｜{ln['text'][:60]}")
+            except Exception as e:
+                print(f"   （讀不到文字位置：{type(e).__name__}）")
+            for top, x0, uri in links:
+                print(f"   連結 y={top} x={x0}｜{uri}")
+                full = urljoin(index, uri)
+                if full not in everything:
+                    everything.append(full)
+                if "繕發" in text and full not in chosen:
+                    chosen.append(full)
 
-    all_pdf, cands = [], []
-    for m in re.finditer(r"(?:https?://|/)[^\s\"'<>\\()]+?\.pdf", raw, flags=re.I):
-        url = urljoin(PAGE, m.group(0))
-        if url not in all_pdf:
-            all_pdf.append(url)
-        ctx = clean(raw[max(0, m.start() - 400):m.end() + 200])
-        if (KEY.search(url) or "實現率" in ctx) and url not in cands:
-            cands.append(url)
-    print(f"\n頁面共有 {len(all_pdf)} 個 PDF 連結，候選 {len(cands)} 個：")
-    for u in cands:
-        print("  ", u)
-    if not cands:
-        print("找不到候選 PDF，頁面可能由 JavaScript 載入。全部 PDF 連結如下：")
-        for u in all_pdf:
-            print("  ", u)
-    for u in cands[:MAX_PDF]:
+    targets = chosen or everything
+    if not targets:
+        print("\n索引文件內找不到任何連結，請把這份日誌傳回，我再換方法")
+        return
+    print(f"\n準備讀取 {min(len(targets), MAX_DOCS)} 份文件（共找到 {len(targets)} 個連結）")
+    for u in targets[:MAX_DOCS]:
         dump(u)
 
 
