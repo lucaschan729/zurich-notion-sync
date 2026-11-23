@@ -1,0 +1,29 @@
+name: sync
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 上傳到 Notion
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 2 * 6-7 1"   # 每年 6–7 月逢星期一 香港時間 10:00
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests openpyxl pdfplumber
+      - run: python main.py
+        env:
+          UPLOAD: ${{ github.event_name == 'schedule' || inputs.upload }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zurich-excel
+          path: "*.xlsx"
